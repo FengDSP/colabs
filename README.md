@@ -1,2 +1,2 @@
 # colabs
-This is a repo for the public colabs and Jupyter notebooks that I wrote.
+Colabs and Jupyter notebooks that I wrote for practice and education purposes.
