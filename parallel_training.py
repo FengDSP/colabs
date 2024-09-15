@@ -1,4 +1,7 @@
 import time
+import os
+import threading
+import time
 
 import numpy as np
 import torch.nn.functional as F
@@ -15,10 +18,9 @@ from mup import MuSGD, get_shapes, set_base_shapes, make_base_shapes, MuReadout
 batch_size = 64
 epochs = 20
 log_interval = 300
-nonlin = torch.relu
-criterion = F.cross_entropy
 data_dir = "/tmp"
-base_shapes_path = './demo_width256.bsh'
+base_shapes_path = "./demo_width256.bsh"
+
 
 def train(
     model,
@@ -28,7 +30,6 @@ def train(
     optimizer,
     train_name,
     scheduler=None,
-    criterion=criterion,
 ):
     model.train()
     train_loss = 0
@@ -38,7 +39,7 @@ def train(
         optimizer.zero_grad()
         output = model(data.view(data.size(0), -1))
 
-        loss = criterion(output, target)
+        loss = F.cross_entropy(output, target)
         loss.backward()
         train_loss += loss.item() * data.shape[0]  # sum up batch loss
         optimizer.step()
@@ -59,11 +60,9 @@ def train(
 
 
 class MLP(nn.Module):
-    def __init__(
-        self, width=128, num_classes=10, nonlin=F.relu, output_mult=1.0, input_mult=1.0
-    ):
+    def __init__(self, width=128, num_classes=10, output_mult=1.0, input_mult=1.0):
         super(MLP, self).__init__()
-        self.nonlin = nonlin
+        self.nonlin = nn.ReLU()
         self.input_mult = input_mult
         self.output_mult = output_mult
         self.fc_1 = nn.Linear(3072, width, bias=False)
@@ -84,20 +83,22 @@ class MLP(nn.Module):
 
 
 class muMLP(nn.Module):
-    def __init__(self, width=128, num_classes=10, nonlin=F.relu, output_mult=1.0, input_mult=1.0):
+    def __init__(self, width=128, num_classes=10, output_mult=1.0, input_mult=1.0):
         super(muMLP, self).__init__()
-        self.nonlin = nonlin
+        self.nonlin = nn.ReLU()
         self.input_mult = input_mult
         self.output_mult = output_mult
         self.fc_1 = nn.Linear(3072, width, bias=False)
         self.fc_2 = nn.Linear(width, width, bias=False)
-        self.fc_3 = MuReadout(width, num_classes, bias=False, output_mult=self.output_mult)
+        self.fc_3 = MuReadout(
+            width, num_classes, bias=False, output_mult=self.output_mult
+        )
         self.reset_parameters()
-    
+
     def reset_parameters(self):
-        nn.init.kaiming_normal_(self.fc_1.weight, a=1, mode='fan_in')
+        nn.init.kaiming_normal_(self.fc_1.weight, a=1, mode="fan_in")
         # self.fc_1.weight.data /= self.input_mult**0.5  # Why this doesn't work in multi processing?
-        nn.init.kaiming_normal_(self.fc_2.weight, a=1, mode='fan_in')
+        nn.init.kaiming_normal_(self.fc_2.weight, a=1, mode="fan_in")
         nn.init.zeros_(self.fc_3.weight)
 
     def forward(self, x):
@@ -144,12 +145,14 @@ def train_with(width, log2lr, epochs=20, mup=True):
                 optimizer=optimizer_class(mlp_model.parameters(), lr=2**log2lr),
                 train_name=f"{train_name} epoch={epoch}",
             )
-            res.append({
-                "width": width,
-                "log2lr": log2lr,
-                "epoch": epoch,
-                "train_loss": train_loss,
-            })
+            res.append(
+                {
+                    "width": width,
+                    "log2lr": log2lr,
+                    "epoch": epoch,
+                    "train_loss": train_loss,
+                }
+            )
     except Exception as e:
         print(f"Exception catched {train_name}: {e}")
         raise
@@ -157,23 +160,36 @@ def train_with(width, log2lr, epochs=20, mup=True):
     return res
 
 
+def worker_initializer(parent_pid):
+    def monitor_parent():
+        while True:
+            current_ppid = os.getppid()
+            if current_ppid != parent_pid:
+                # Parent process has exited
+                print(f"Worker {os.getpid()} detected parent exit, terminating.")
+                os._exit(0)  # Forcefully exit the child process
+            time.sleep(1)  # Check every second
+
+    # Start the monitoring thread
+    thread = threading.Thread(target=monitor_parent, daemon=True)
+    thread.start()
+
+
 def main():
-    base_shapes = get_shapes(MLP(width=256, nonlin=torch.relu))
-    delta_shapes = get_shapes(
-        # just need to change whatever dimension(s) we are scaling
-        MLP(width=256+1, nonlin=torch.relu)
-    )
+    base_shapes = get_shapes(MLP(width=256))
+    # just need to change whatever dimension(s) we are scaling
+    delta_shapes = get_shapes(MLP(width=256 + 1))
     make_base_shapes(base_shapes, delta_shapes, savefile=base_shapes_path)
 
-    # Test a single process trainer run.
-    # train_with(64, -1)
-
     print("Running trainers ...")
-    num_trains = 40
+    num_trains = 20
     results = []
-    with ProcessPoolExecutor(max_workers=num_trains) as pool:
+    parent_pid = os.getpid()
+    with ProcessPoolExecutor(
+        max_workers=num_trains, initializer=worker_initializer, initargs=(parent_pid,)
+    ) as pool:
         futures = []
-        for width in [64]:  # [8192, 4096, 2048]:
+        for width in [1024, 512, 256, 128, 64]:  # [8192, 4096, 2048]:
             for log2lr in np.linspace(-8, -1, 8):
                 future = pool.submit(train_with, width, log2lr)
                 futures.append(future)
@@ -189,5 +205,5 @@ def main():
 
 
 if __name__ == "__main__":
-    multiprocessing.set_start_method('spawn')
+    multiprocessing.set_start_method("spawn")
     main()
