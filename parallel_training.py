@@ -9,8 +9,8 @@ from torchvision import datasets, transforms
 import torch
 from torch import nn
 import pandas as pd
-from concurrent.futures import ProcessPoolExecutor
-import multiprocessing
+# from concurrent.futures import ProcessPoolExecutor
+import torch.multiprocessing as multiprocessing
 
 from mup import MuSGD, get_shapes, set_base_shapes, make_base_shapes, MuReadout
 
@@ -116,7 +116,7 @@ def train_with(width, log2lr, epochs=20, mup=True):
         root=data_dir, train=True, download=True, transform=transform
     )
     train_loader = torch.utils.data.DataLoader(
-        trainset, batch_size=batch_size, shuffle=True, num_workers=1
+        trainset, batch_size=batch_size, shuffle=True, num_workers=0
     )
     # testset = datasets.CIFAR10(
     #     root=data_dir, train=False, download=True, transform=transform
@@ -125,7 +125,10 @@ def train_with(width, log2lr, epochs=20, mup=True):
     #     testset, batch_size=batch_size, shuffle=False, num_workers=2
     #     )
 
-    device = torch.device("cuda")
+    # device = torch.device("cuda")  # changing to the explicit device set solves the OOM issue somehow.
+    device_id = 0
+    torch.cuda.set_device(device_id)
+    device = torch.device(f"cuda:{device_id}")
     train_name = f"width={width} log2lr={log2lr}"
     print(f"Training starting {train_name}")
     res = []
@@ -156,23 +159,12 @@ def train_with(width, log2lr, epochs=20, mup=True):
     except Exception as e:
         print(f"Exception catched {train_name}: {e}")
         raise
+
     print(f"Training finished. {train_name}")
-    return res
-
-
-def worker_initializer(parent_pid):
-    def monitor_parent():
-        while True:
-            current_ppid = os.getppid()
-            if current_ppid != parent_pid:
-                # Parent process has exited
-                print(f"Worker {os.getpid()} detected parent exit, terminating.")
-                os._exit(0)  # Forcefully exit the child process
-            time.sleep(1)  # Check every second
-
-    # Start the monitoring thread
-    thread = threading.Thread(target=monitor_parent, daemon=True)
-    thread.start()
+    
+    df = pd.DataFrame(res)
+    output_file = "cifar10_mup.jsonl" if mup else "cifar10_std.jsonl"
+    df.to_json(output_file, orient="records", lines=True, mode='a')
 
 
 def main():
@@ -182,26 +174,15 @@ def main():
     make_base_shapes(base_shapes, delta_shapes, savefile=base_shapes_path)
 
     print("Running trainers ...")
-    num_trains = 20
-    results = []
-    parent_pid = os.getpid()
-    with ProcessPoolExecutor(
-        max_workers=num_trains, initializer=worker_initializer, initargs=(parent_pid,)
-    ) as pool:
-        futures = []
-        for width in [1024, 512, 256, 128, 64]:  # [8192, 4096, 2048]:
-            for log2lr in np.linspace(-8, -1, 8):
-                future = pool.submit(train_with, width, log2lr)
-                futures.append(future)
-        print("Waiting for results ...")
-        for f in futures:
-            try:
-                results.extend(f.result())
-            except Exception as e:
-                print(f"Task generated an exception: {e}")
-                raise
-    df = pd.DataFrame(results)
-    df.to_json("cifar10_mu1.jsonl", orient="records", lines=True)
+    processes = []
+    for width in [8192, 4096]:  # [2048, 1024]:  #[512, 256]:  # [128, 64]:
+        for log2lr in np.linspace(-8, -1, 8):
+            proc = multiprocessing.Process(target=train_with, args=(width, log2lr), daemon=True)
+            proc.start()
+            processes.append(proc)
+    print("Waiting for results ...")
+    for proc in processes:
+        proc.join()
 
 
 if __name__ == "__main__":
